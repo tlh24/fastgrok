@@ -75,6 +75,8 @@ class GrokkingTransformer(nn.Module):
 
 		# Inject Position Information
 		positions = torch.arange(seq_len, device=e.device)
+		# positions = torch.tensor([0, 0, 2], device=e.device)
+			#force commutativity.  This is worse!
 		e = e + self.pos_emb(positions)
 
 		x_norm = self.ln1(e)
@@ -281,7 +283,7 @@ def run_experiment_train_frac():
 		def train_rep(rep, frac=frac):
 			print(f"Training p=113 train_frac={frac:.0%} replicate {rep+1}/{n_replicates}...")
 			return train_model(
-				p=113, epochs=epochs, device=device, batch_size=BATCH_SIZE,
+				p=113, epochs=epochs, device=device, batch_size=16, #note smaller batch size!
 				use_norm=True, mlp_bias=False, weight_decay=2e-2, train_frac=frac)
 		with ThreadPoolExecutor(max_workers=n_replicates) as pool:
 			results[fi] = list(pool.map(train_rep, range(n_replicates)))
