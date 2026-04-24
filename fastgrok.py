@@ -21,7 +21,7 @@ def show_or_save(fig, name):
 	if SHOW_PLOTS:
 		plt.show()
 	else:
-		fname = f"fig_{_fig_counter[0]:02d}_{name}.pdf"
+		fname = f"fastgrok_{_fig_counter[0]:02d}_{name}.pdf"
 		fig.savefig(fname, bbox_inches='tight')
 		print(f"Saved {fname}")
 		plt.close(fig)
@@ -139,7 +139,12 @@ def train_model(p=59, d=128, epochs=1000, device='cpu', batch_size=None, use_nor
 
 	model = GrokkingTransformer(p, d, use_norm=use_norm, mlp_bias=mlp_bias, mlp_act=mlp_act).to(device)
 
-	optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=weight_decay, amsgrad=True)
+	optimizer = optim.AdamW(model.parameters(),
+							lr=1e-3,
+							weight_decay=weight_decay,
+							amsgrad=True,
+							betas=(0.9, 0.95),     # Shortened beta_2 memory
+							eps=1e-4)              #  prevent division-by-zero explosions)
 	criterion = nn.CrossEntropyLoss()
 	history = {'train_loss':[], 'val_loss':[], 'val_acc':[]}
 
