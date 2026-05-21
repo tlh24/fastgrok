@@ -7,8 +7,8 @@ from torch.func import vmap, jacrev
 from concurrent.futures import ThreadPoolExecutor
 import pdb
 
-BATCH_SIZE = 128
-N_REPLICATES = 5
+BATCH_SIZE = 64
+N_REPLICATES = 4
 SHOW_PLOTS = False  # if False, save figures as PDFs instead of displaying
 USE_ROPE = True # if False, use learned position encoding.
 
@@ -19,18 +19,15 @@ if not SHOW_PLOTS:
     matplotlib.use('Agg')  # thread-safe non-interactive backend
 import matplotlib.pyplot as plt
 
-_fig_counter = [0]
-
 def show_or_save(fig, name):
 	if SHOW_PLOTS:
 		plt.show()
 	else:
-		rope = '_rope' if USE_ROPE else ''
-		fname = f"fig{rope}_{_fig_counter[0]:02d}_{name}.pdf"
+		rope = 'rope' if USE_ROPE else ''
+		fname = f"fastgrok_{rope}_{name}.pdf"
 		fig.savefig(fname, bbox_inches='tight')
 		print(f"Saved {fname}")
 		plt.close(fig)
-		_fig_counter[0] += 1
 
 
 class GrokkingTransformer(nn.Module):
@@ -83,6 +80,8 @@ class GrokkingTransformer(nn.Module):
 
 		if not USE_ROPE:
 			positions = torch.arange(seq_len, device=e.device)
+			# positions = torch.tensor([0, 0, 2], device=e.device)
+			# force commutativity.  This is worse!
 			e = e + self.pos_emb(positions)
 
 		x_norm = self.ln1(e)
@@ -123,7 +122,19 @@ class GrokkingTransformer(nn.Module):
 		if not is_batched: logits = logits.squeeze(0)
 		return logits
 
-def train_model(p=59, d=128, epochs=1000, device='cpu', batch_size=None, use_norm=False, mlp_bias=True, weight_decay=2e-2, train_frac=0.6, mlp_act='relu'):
+
+def make_device_selector():
+	n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+	if n_gpus > 1:
+		print(f"Found {n_gpus} GPUs, cycling replicates across them.")
+		return lambda rep: torch.device(f'cuda:{rep % n_gpus}')
+	else:
+		device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+		print(f"Using device: {device}")
+		return lambda rep: device
+
+
+def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=False, mlp_bias=True, weight_decay=2e-2, train_frac=0.6, mlp_act='relu', betas=(0.9, 0.995), schedule_wd=False):
 	dataset, labels = [], []
 	for a in range(p):
 		for b in range(p):
@@ -145,13 +156,25 @@ def train_model(p=59, d=128, epochs=1000, device='cpu', batch_size=None, use_nor
 	# steps_per_epoch: gradient steps per effective epoch (full-dataset pass equivalent)
 	steps_per_epoch = n_train // batch_size if use_minibatch else 1
 	total_steps = epochs * steps_per_epoch
-	log_every = 1 * steps_per_epoch  # log every effective epoch
+	# For small batches, cap validation frequency to ~1 check per 256 samples processed
+	if use_minibatch and batch_size < 256:
+		log_every = max(1, 256 // batch_size)
+	else:
+		log_every = steps_per_epoch
 
 	model = GrokkingTransformer(p, d, use_norm=use_norm, mlp_bias=mlp_bias, mlp_act=mlp_act).to(device)
 
-	optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=weight_decay, amsgrad=True)
+	optimizer = optim.AdamW(model.parameters(),
+							lr=1e-3,
+							weight_decay=weight_decay,
+							amsgrad=True,
+							betas=betas,
+							eps=1e-5)              #  prevent division-by-zero explosions)
 	criterion = nn.CrossEntropyLoss()
-	history = {'train_loss':[], 'val_loss':[], 'val_acc':[]}
+	history = {'train_loss':[], 'val_loss':[], 'val_acc':[], 'epoch_x':[]}
+	current_wd = weight_decay
+	current_lr = 1e-3
+	last_decay_epoch = -1
 
 	for step in range(total_steps):
 		model.train()
@@ -164,6 +187,16 @@ def train_model(p=59, d=128, epochs=1000, device='cpu', batch_size=None, use_nor
 		else:
 			batch_data = train_data
 			batch_labels = train_labels
+
+		if schedule_wd:
+			epoch_num = step // steps_per_epoch
+			if epoch_num >= 24 and (epoch_num - 24) % 8 == 0 and epoch_num != last_decay_epoch:
+				current_wd *= 0.5
+				current_lr *= 0.5
+				last_decay_epoch = epoch_num
+				for pg in optimizer.param_groups:
+					pg['weight_decay'] = current_wd
+					pg['learning_rate'] = current_lr
 
 		logits = model(batch_data)
 		loss = criterion(logits, batch_labels)
@@ -178,16 +211,19 @@ def train_model(p=59, d=128, epochs=1000, device='cpu', batch_size=None, use_nor
 				preds = torch.argmax(val_logits, dim=1)
 				v_acc = (preds == val_labels).float().mean().item()
 
+				history['epoch_x'].append(step / steps_per_epoch)
 				history['train_loss'].append(loss.item())
 				history['val_loss'].append(v_loss)
 				history['val_acc'].append(v_acc)
+
+				if v_acc >= 1.0:
+					break
 
 	return model, history
 
 
 def run_experiment():
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	print(f"Using device: {device}")
+	get_device = make_device_selector()
 	epochs = 250
 	n_replicates = N_REPLICATES
 
@@ -204,9 +240,10 @@ def run_experiment():
 	def train_condition(ci_cond):
 		ci, cond = ci_cond
 		def train_rep(rep):
-			print(f"Training {cond['label']} replicate {rep+1}/{n_replicates}...")
+			dev = get_device(rep)
+			print(f"Training {cond['label']} replicate {rep+1}/{n_replicates} on {dev}...")
 			return train_model(
-				epochs=epochs, device=device, batch_size=BATCH_SIZE,
+				epochs=epochs, device=dev, batch_size=BATCH_SIZE,
 				use_norm=cond['use_norm'], mlp_bias=cond['mlp_bias'],
 				weight_decay=cond['weight_decay'], mlp_act=cond['mlp_act'])
 		with ThreadPoolExecutor(max_workers=n_replicates) as pool:
@@ -216,18 +253,16 @@ def run_experiment():
 		results[ci] = train_condition((ci, cond))
 
 	# Plot 1: Curves
-	epochs_x = np.arange(0, epochs, 1)
-
 	fig1, (ax_acc, ax_loss) = plt.subplots(1, 2, figsize=(14, 5))
 
 	for ci, cond in enumerate(conditions):
 		for rep, (_, hist) in enumerate(results[ci]):
 			label = cond['label'] if rep == 0 else '_nolegend_'
-			ax_acc.plot(epochs_x, hist['val_acc'], label=label, color=cond['color'], alpha=0.6)
-			ax_loss.plot(epochs_x, hist['train_loss'], label=f"{cond['label']} Train" if rep == 0 else '_nolegend_',
-				color=cond['train_color'], linestyle='--', alpha=0.6)
-			ax_loss.plot(epochs_x, hist['val_loss'], label=f"{cond['label']} Val" if rep == 0 else '_nolegend_',
-				color=cond['color'], alpha=0.6)
+			ax_acc.plot(hist['epoch_x'], hist['val_acc'], label=label, color=cond['color'], alpha=0.6, marker='o', markevery=[-1], markersize=5)
+			ax_loss.plot(hist['epoch_x'], hist['train_loss'], label=f"{cond['label']} Train" if rep == 0 else '_nolegend_',
+				color=cond['train_color'], linestyle='--', alpha=0.6, marker='o', markevery=[-1], markersize=5)
+			ax_loss.plot(hist['epoch_x'], hist['val_loss'], label=f"{cond['label']} Val" if rep == 0 else '_nolegend_',
+				color=cond['color'], alpha=0.6, marker='o', markevery=[-1], markersize=5)
 
 	ax_acc.set_title("Validation Accuracy")
 	ax_acc.set_xlabel("Effective Epochs")
@@ -248,7 +283,8 @@ def run_experiment():
 	def get_agop_matrix(model):
 		model.eval()
 		p = model.p
-		dataset = torch.tensor([[a, b, p] for a in range(p) for b in range(p)]).to(device)
+		dev = next(model.parameters()).device
+		dataset = torch.tensor([[a, b, p] for a in range(p) for b in range(p)]).to(dev)
 
 		e = model.embed(dataset)
 		J = vmap(jacrev(lambda x: model.forward_from_embeddings(x)))(e)
@@ -278,9 +314,8 @@ def run_experiment():
 	show_or_save(fig2, 'agop')
 
 def run_experiment_train_frac():
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	print(f"Using device: {device}")
-	epochs = 800
+	get_device = make_device_selector()
+	epochs = 250
 	n_replicates = N_REPLICATES
 	train_fracs = [0.30, 0.40, 0.50, 0.70]
 	colors      = ['purple', 'blue', 'orange', 'green']
@@ -291,27 +326,27 @@ def run_experiment_train_frac():
 
 	for fi, frac in enumerate(train_fracs):
 		def train_rep(rep, frac=frac):
-			print(f"Training p=113 train_frac={frac:.0%} replicate {rep+1}/{n_replicates}...")
+			dev = get_device(rep)
+			print(f"Training p=113 train_frac={frac:.0%} replicate {rep+1}/{n_replicates} on {dev}...")
 			return train_model(
-				p=113, epochs=epochs, device=device, batch_size=BATCH_SIZE,
-				use_norm=True, mlp_bias=False, weight_decay=2e-2, train_frac=frac)
+				p=113, epochs=epochs, device=dev, batch_size=8, #note smaller batch size!
+				use_norm=True, mlp_bias=False, weight_decay=0.02, train_frac=frac, schedule_wd=True)
 		with ThreadPoolExecutor(max_workers=n_replicates) as pool:
 			results[fi] = list(pool.map(train_rep, range(n_replicates)))
 
-	epochs_x = np.arange(0, epochs, 1)
 	fig, (ax_acc, ax_loss) = plt.subplots(1, 2, figsize=(14, 5))
 	fig.suptitle("p=113, LayerNorm on, no MLP bias — varying train fraction")
 
 	for fi, frac in enumerate(train_fracs):
 		for rep, (_, hist) in enumerate(results[fi]):
 			label = f"{frac:.0%} train" if rep == 0 else '_nolegend_'
-			ax_acc.plot(epochs_x, hist['val_acc'], label=label, color=colors[fi], alpha=0.6)
-			ax_loss.plot(epochs_x, hist['train_loss'],
+			ax_acc.plot(hist['epoch_x'], hist['val_acc'], label=label, color=colors[fi], alpha=0.6, marker='o', markevery=[-1], markersize=5)
+			ax_loss.plot(hist['epoch_x'], hist['train_loss'],
 				label=f"{frac:.0%} Train" if rep == 0 else '_nolegend_',
-				color=train_colors[fi], linestyle='--', alpha=0.6)
-			ax_loss.plot(epochs_x, hist['val_loss'],
+				color=train_colors[fi], linestyle='--', alpha=0.6, marker='o', markevery=[-1], markersize=5)
+			ax_loss.plot(hist['epoch_x'], hist['val_loss'],
 				label=f"{frac:.0%} Val" if rep == 0 else '_nolegend_',
-				color=colors[fi], alpha=0.6)
+				color=colors[fi], alpha=0.6, marker='o', markevery=[-1], markersize=5)
 
 	ax_acc.set_title("Validation Accuracy")
 	ax_acc.set_xlabel("Effective Epochs")
@@ -329,46 +364,45 @@ def run_experiment_train_frac():
 	show_or_save(fig, 'train_frac')
 
 def run_experiment_batch_size():
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	print(f"Using device: {device}")
-	epochs = 500
+	get_device = make_device_selector()
+	epochs = 250
 	n_replicates = N_REPLICATES
 	p = 59
 	train_frac = 0.6
 	n_train = int(train_frac * p * p)  # 2088
 
 	# Powers of 2 from 8 up to n_train, then None (full batch)
-	batch_sizes = [2**k for k in range(3, 12) if 2**k < n_train] + [None]
+	batch_sizes = [2**k for k in range(0, 12) if 2**k < n_train] + [None]
 	labels = [str(bs) if bs is not None else f"full ({n_train})" for bs in batch_sizes]
 
-	cmap = matplotlib.colormaps['plasma']
-	colors = [cmap(i / (len(batch_sizes) - 1)) for i in range(len(batch_sizes))]
+	cmap = matplotlib.colormaps['hsv']
+	colors = [(r*0.7, g*0.7, b*0.7, a) for r, g, b, a in [cmap(i / (len(batch_sizes) - 1)) for i in range(len(batch_sizes))]]
 
 	results = [None for _ in batch_sizes]
 
 	for bi, bs in enumerate(batch_sizes):
 		def train_rep(rep, bs=bs):
-			print(f"Training batch_size={bs} replicate {rep+1}/{n_replicates}...")
+			dev = get_device(rep)
+			print(f"Training batch_size={bs} replicate {rep+1}/{n_replicates} on {dev}...")
 			return train_model(
-				p=p, epochs=epochs, device=device, batch_size=bs,
-				use_norm=True, mlp_bias=False, weight_decay=0.0, train_frac=train_frac)
+				p=p, epochs=epochs, device=dev, batch_size=bs,
+				use_norm=True, mlp_bias=False, weight_decay=0.02, train_frac=train_frac)
 		with ThreadPoolExecutor(max_workers=n_replicates) as pool:
 			results[bi] = list(pool.map(train_rep, range(n_replicates)))
 
-	epochs_x = np.arange(0, epochs, 1)
 	fig, (ax_acc, ax_loss) = plt.subplots(1, 2, figsize=(14, 5))
-	fig.suptitle("p=59, LN on, no bias, no decay — varying minibatch size")
+	fig.suptitle("p=59, LN on, no bias, 60% train frac")
 
 	for bi, (bs, label) in enumerate(zip(batch_sizes, labels)):
 		for rep, (_, hist) in enumerate(results[bi]):
 			lbl = label if rep == 0 else '_nolegend_'
-			ax_acc.plot(epochs_x, hist['val_acc'], label=lbl, color=colors[bi], alpha=0.6)
-			ax_loss.plot(epochs_x, hist['train_loss'],
+			ax_acc.plot(hist['epoch_x'], hist['val_acc'], label=lbl, color=colors[bi], alpha=0.6, marker='o', markevery=[-1], markersize=5)
+			ax_loss.plot(hist['epoch_x'], hist['train_loss'],
 				label=f"{label} train" if rep == 0 else '_nolegend_',
-				color=colors[bi], linestyle='--', alpha=0.6)
-			ax_loss.plot(epochs_x, hist['val_loss'],
+				color=colors[bi], linestyle='--', alpha=0.6, marker='o', markevery=[-1], markersize=5)
+			ax_loss.plot(hist['epoch_x'], hist['val_loss'],
 				label=f"{label} val" if rep == 0 else '_nolegend_',
-				color=colors[bi], alpha=0.6)
+				color=colors[bi], alpha=0.6, marker='o', markevery=[-1], markersize=5)
 
 	ax_acc.set_title("Validation Accuracy")
 	ax_acc.set_xlabel("Effective Epochs")
@@ -386,6 +420,6 @@ def run_experiment_batch_size():
 	show_or_save(fig, 'batch_size')
 
 if __name__ == "__main__":
-	run_experiment()
+	# run_experiment()
 	run_experiment_train_frac()
-	run_experiment_batch_size()
+	# run_experiment_batch_size()
