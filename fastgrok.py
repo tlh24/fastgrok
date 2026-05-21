@@ -10,6 +10,10 @@ import pdb
 BATCH_SIZE = 128
 N_REPLICATES = 5
 SHOW_PLOTS = False  # if False, save figures as PDFs instead of displaying
+USE_ROPE = True # if False, use learned position encoding.
+
+if USE_ROPE:
+	from rotary_embedding_torch import RotaryEmbedding
 
 if not SHOW_PLOTS:
     matplotlib.use('Agg')  # thread-safe non-interactive backend
@@ -21,7 +25,8 @@ def show_or_save(fig, name):
 	if SHOW_PLOTS:
 		plt.show()
 	else:
-		fname = f"fig_{_fig_counter[0]:02d}_{name}.pdf"
+		rope = '_rope' if USE_ROPE else ''
+		fname = f"fig{rope}_{_fig_counter[0]:02d}_{name}.pdf"
 		fig.savefig(fname, bbox_inches='tight')
 		print(f"Saved {fname}")
 		plt.close(fig)
@@ -41,8 +46,11 @@ class GrokkingTransformer(nn.Module):
 		self.embed = nn.Embedding(p + 1, d)
 		nn.init.normal_(self.embed.weight, std=0.02)
 
-		self.pos_emb = nn.Embedding(3, d)
-		nn.init.normal_(self.pos_emb.weight, std=0.02)
+		if USE_ROPE:
+			self.rope = RotaryEmbedding(dim=self.head_dim)
+		else:
+			self.pos_emb = nn.Embedding(3, d)
+			nn.init.normal_(self.pos_emb.weight, std=0.02)
 
 		# Multi-head attention projections
 		self.W_q = nn.Linear(d, d, bias=False)
@@ -73,9 +81,9 @@ class GrokkingTransformer(nn.Module):
 
 		B, seq_len, d = e.shape
 
-		# Inject Position Information
-		positions = torch.arange(seq_len, device=e.device)
-		e = e + self.pos_emb(positions)
+		if not USE_ROPE:
+			positions = torch.arange(seq_len, device=e.device)
+			e = e + self.pos_emb(positions)
 
 		x_norm = self.ln1(e)
 		q, k, v = self.W_q(x_norm), self.W_k(x_norm), self.W_v(x_norm)
@@ -85,6 +93,10 @@ class GrokkingTransformer(nn.Module):
 			return t.view(B, seq_len, self.n_heads, self.head_dim).transpose(1, 2).reshape(B * self.n_heads, seq_len, self.head_dim)
 
 		q, k, v = split_heads(q), split_heads(k), split_heads(v)
+
+		if USE_ROPE:
+			q = self.rope.rotate_queries_or_keys(q.view(B, self.n_heads, seq_len, self.head_dim)).reshape(B * self.n_heads, seq_len, self.head_dim)
+			k = self.rope.rotate_queries_or_keys(k.view(B, self.n_heads, seq_len, self.head_dim)).reshape(B * self.n_heads, seq_len, self.head_dim)
 
 		scores = torch.bmm(q, k.transpose(1, 2)) / np.sqrt(self.head_dim)
 
