@@ -9,7 +9,7 @@ import pdb
 
 BATCH_SIZE = 64
 N_REPLICATES = 4
-JOBS_PER_GPU = 8   # concurrent training runs per GPU for weight-scale experiment
+JOBS_PER_GPU = 4   # concurrent training runs per GPU for weight-scale experiment
 SHOW_PLOTS = False  # if False, save figures as PDFs instead of displaying
 USE_ROPE = True # if False, use learned position encoding.
 
@@ -170,7 +170,7 @@ def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=
 			for param in model.parameters():
 				param.mul_(weight_scale)
 
-	model = torch.compile(model)
+	model = torch.compile(model, dynamic=True)
 
 	optimizer = optim.AdamW(model.parameters(),
 							lr=1e-3,
@@ -185,7 +185,6 @@ def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=
 	last_decay_epoch = -1
 
 	for step in range(total_steps):
-		model.train()
 		optimizer.zero_grad()
 
 		if use_minibatch:
@@ -212,19 +211,20 @@ def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=
 		optimizer.step()
 
 		if step % log_every == 0:
-			model.eval()
-			with torch.no_grad():
-				val_logits = model(val_data)
-				v_loss = criterion(val_logits, val_labels).item()
-				preds = torch.argmax(val_logits, dim=1)
-				v_acc = (preds == val_labels).float().mean().item()
+			# No train/eval toggle and no no_grad: avoids dynamo grad_mode recompilation.
+			# This model has no dropout/batchnorm so toggling is a no-op anyway.
+			# .detach() frees the val graph immediately without building a second compiled variant.
+			val_logits = model(val_data).detach()
+			v_loss = criterion(val_logits, val_labels).item()
+			preds = torch.argmax(val_logits, dim=1)
+			v_acc = (preds == val_labels).float().mean().item()
 
-				history['epoch_x'].append(step / steps_per_epoch)
-				history['train_loss'].append(loss.item())
-				history['val_loss'].append(v_loss)
-				history['val_acc'].append(v_acc)
+			history['epoch_x'].append(step / steps_per_epoch)
+			history['train_loss'].append(loss.item())
+			history['val_loss'].append(v_loss)
+			history['val_acc'].append(v_acc)
 
-				if v_acc >= 1.0:
+			if v_acc >= 1.0:
 					break
 
 	return model, history
