@@ -9,7 +9,7 @@ import pdb
 
 BATCH_SIZE = 64
 N_REPLICATES = 4
-JOBS_PER_GPU = 4   # concurrent training runs per GPU for weight-scale experiment
+JOBS_PER_GPU = 8   # concurrent training runs per GPU for weight-scale experiment
 SHOW_PLOTS = False  # if False, save figures as PDFs instead of displaying
 USE_ROPE = True # if False, use learned position encoding.
 
@@ -170,7 +170,7 @@ def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=
 			for param in model.parameters():
 				param.mul_(weight_scale)
 
-	model = torch.compile(model, dynamic=True)
+	# model = torch.compile(model, dynamic=True)
 
 	optimizer = optim.AdamW(model.parameters(),
 							lr=1e-3,
