@@ -138,7 +138,7 @@ def make_device_selector():
 		return lambda rep: device
 
 
-def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=False, mlp_bias=True, weight_decay=2e-2, train_frac=0.6, mlp_act='relu', betas=(0.9, 0.995), schedule_wd=False, weight_scale=1.0):
+def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=False, mlp_bias=True, weight_decay=2e-2, train_frac=0.6, mlp_act='relu', betas=(0.9, 0.995), schedule_wd=False, weight_scale=1.0, compile_model=True):
 	dataset, labels = [], []
 	for a in range(p):
 		for b in range(p):
@@ -173,8 +173,6 @@ def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=
 			for param in model.parameters():
 				param.mul_(weight_scale)
 
-	model = torch.compile(model)
-
 	optimizer = optim.AdamW(model.parameters(),
 							lr=1e-3,
 							weight_decay=weight_decay,
@@ -183,16 +181,18 @@ def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=
 							eps=1e-5)              #  prevent division-by-zero explosions)
 	criterion = nn.CrossEntropyLoss()
 
-	# PyTorch's CompileEventLogger has shared mutable state that is not
-	# thread-safe. Serialise the first fwd+bwd (training shape) and the first
-	# fwd (val shape) for each model so all AOT-Autograd compilation is done
-	# before threads run concurrently. Shapes are fixed after this point, so
-	# there are no further compilation events during training.
-	with _compile_lock:
-		_nb = min(batch_size if batch_size is not None else n_train, n_train)
-		criterion(model(train_data[:_nb]), train_labels[:_nb]).backward()
-		optimizer.zero_grad()
-		model(val_data)  # pre-warm val forward shape
+	if compile_model:
+		model = torch.compile(model)
+		# CompileEventLogger.compilation_metric is called on every compiled
+		# backward (not just first-time compilation) and writes to shared
+		# class-level state — it is not thread-safe. Pre-warm fwd+bwd under a
+		# lock so all AOT-Autograd tracing finishes before parallel training
+		# begins. Only safe to use compile_model=True in single-threaded runs.
+		with _compile_lock:
+			_nb = min(batch_size if batch_size is not None else n_train, n_train)
+			criterion(model(train_data[:_nb]), train_labels[:_nb]).backward()
+			optimizer.zero_grad()
+			model(val_data)
 
 	history = {'train_loss':[], 'val_loss':[], 'val_acc':[], 'epoch_x':[]}
 	current_wd = weight_decay
@@ -472,7 +472,8 @@ def run_experiment_weight_scale():
 		return train_model(
 			p=p, epochs=epochs, device=dev, batch_size=batch_size,
 			use_norm=True, mlp_bias=False, weight_decay=0.02,
-			train_frac=train_frac, weight_scale=scale)
+			train_frac=train_frac, weight_scale=scale,
+			compile_model=False)  # torch.compile is not thread-safe (CompileEventLogger race)
 
 	print(f"Running {len(all_jobs)} jobs across {n_gpus} GPU(s), {max_workers} concurrent.")
 	with ThreadPoolExecutor(max_workers=max_workers) as pool:
