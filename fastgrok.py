@@ -9,6 +9,7 @@ import pdb
 
 BATCH_SIZE = 64
 N_REPLICATES = 4
+JOBS_PER_GPU = 8   # concurrent training runs per GPU for weight-scale experiment
 SHOW_PLOTS = False  # if False, save figures as PDFs instead of displaying
 USE_ROPE = True # if False, use learned position encoding.
 
@@ -425,12 +426,15 @@ def run_experiment_batch_size():
 	show_or_save(fig, 'batch_size')
 
 def run_experiment_weight_scale():
-	get_device = make_device_selector()
 	epochs = 250
 	n_replicates = N_REPLICATES
 	p = 113
 	train_frac = 0.7
 	batch_size = 16
+
+	n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+	base_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+	max_workers = n_gpus * JOBS_PER_GPU  # e.g. 2 GPUs × 8 = 16 concurrent jobs
 
 	# 3 points per octave from 1/16 (2^-4) to 16 (2^4), inclusive → 8 octaves × 3 + 1 = 25 points
 	scales = np.geomspace(1/16, 16, 3 * 8 + 1)
@@ -438,18 +442,29 @@ def run_experiment_weight_scale():
 	cmap = matplotlib.colormaps['plasma']
 	colors = [cmap(i / (len(scales) - 1)) for i in range(len(scales))]
 
-	results = [None for _ in scales]
+	# Build a flat list of (scale_idx, scale, rep) jobs; device cycles across GPUs by job slot
+	all_jobs = [(si, scale, rep)
+	            for si, scale in enumerate(scales)
+	            for rep in range(n_replicates)]
 
-	for si, scale in enumerate(scales):
-		def train_rep(rep, scale=scale):
-			dev = get_device(rep)
-			print(f"Training weight_scale={scale:.4f} replicate {rep+1}/{n_replicates} on {dev}...")
-			return train_model(
-				p=p, epochs=epochs, device=dev, batch_size=batch_size,
-				use_norm=True, mlp_bias=False, weight_decay=0.02,
-				train_frac=train_frac, weight_scale=scale)
-		with ThreadPoolExecutor(max_workers=n_replicates) as pool:
-			results[si] = list(pool.map(train_rep, range(n_replicates)))
+	def train_job(args):
+		si, scale, rep = args
+		job_idx = si * n_replicates + rep
+		dev = torch.device(f'cuda:{job_idx % n_gpus}') if n_gpus > 1 else torch.device(base_device)
+		print(f"Training weight_scale={scale:.4f} rep {rep+1}/{n_replicates} on {dev}...")
+		return train_model(
+			p=p, epochs=epochs, device=dev, batch_size=batch_size,
+			use_norm=True, mlp_bias=False, weight_decay=0.02,
+			train_frac=train_frac, weight_scale=scale)
+
+	print(f"Running {len(all_jobs)} jobs across {n_gpus} GPU(s), {max_workers} concurrent.")
+	with ThreadPoolExecutor(max_workers=max_workers) as pool:
+		flat_results = list(pool.map(train_job, all_jobs))
+
+	# Reassemble into results[si][rep]
+	results = [[None] * n_replicates for _ in scales]
+	for (si, scale, rep), result in zip(all_jobs, flat_results):
+		results[si][rep] = result
 
 	# Plot 1: Learning curves (val acc + train/val loss)
 	fig1, (ax_acc, ax_loss) = plt.subplots(1, 2, figsize=(14, 5))
