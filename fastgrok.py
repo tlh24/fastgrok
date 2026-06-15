@@ -5,7 +5,10 @@ import numpy as np
 import matplotlib
 from torch.func import vmap, jacrev
 from concurrent.futures import ThreadPoolExecutor
+import threading
 import pdb
+
+_compile_lock = threading.Lock()
 
 BATCH_SIZE = 64
 N_REPLICATES = 4
@@ -170,7 +173,7 @@ def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=
 			for param in model.parameters():
 				param.mul_(weight_scale)
 
-	model = torch.compile(model) # dynamc=True
+	model = torch.compile(model)
 
 	optimizer = optim.AdamW(model.parameters(),
 							lr=1e-3,
@@ -179,6 +182,18 @@ def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=
 							betas=betas,
 							eps=1e-5)              #  prevent division-by-zero explosions)
 	criterion = nn.CrossEntropyLoss()
+
+	# PyTorch's CompileEventLogger has shared mutable state that is not
+	# thread-safe. Serialise the first fwd+bwd (training shape) and the first
+	# fwd (val shape) for each model so all AOT-Autograd compilation is done
+	# before threads run concurrently. Shapes are fixed after this point, so
+	# there are no further compilation events during training.
+	with _compile_lock:
+		_nb = min(batch_size if batch_size is not None else n_train, n_train)
+		criterion(model(train_data[:_nb]), train_labels[:_nb]).backward()
+		optimizer.zero_grad()
+		model(val_data)  # pre-warm val forward shape
+
 	history = {'train_loss':[], 'val_loss':[], 'val_acc':[], 'epoch_x':[]}
 	current_wd = weight_decay
 	current_lr = 1e-3
