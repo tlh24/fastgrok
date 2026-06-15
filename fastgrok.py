@@ -170,6 +170,8 @@ def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=
 			for param in model.parameters():
 				param.mul_(weight_scale)
 
+	model = torch.compile(model)
+
 	optimizer = optim.AdamW(model.parameters(),
 							lr=1e-3,
 							weight_decay=weight_decay,
