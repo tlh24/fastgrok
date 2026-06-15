@@ -134,7 +134,7 @@ def make_device_selector():
 		return lambda rep: device
 
 
-def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=False, mlp_bias=True, weight_decay=2e-2, train_frac=0.6, mlp_act='relu', betas=(0.9, 0.995), schedule_wd=False):
+def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=False, mlp_bias=True, weight_decay=2e-2, train_frac=0.6, mlp_act='relu', betas=(0.9, 0.995), schedule_wd=False, weight_scale=1.0):
 	dataset, labels = [], []
 	for a in range(p):
 		for b in range(p):
@@ -163,6 +163,11 @@ def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=
 		log_every = steps_per_epoch
 
 	model = GrokkingTransformer(p, d, use_norm=use_norm, mlp_bias=mlp_bias, mlp_act=mlp_act).to(device)
+
+	if weight_scale != 1.0:
+		with torch.no_grad():
+			for param in model.parameters():
+				param.mul_(weight_scale)
 
 	optimizer = optim.AdamW(model.parameters(),
 							lr=1e-3,
@@ -419,7 +424,91 @@ def run_experiment_batch_size():
 	plt.tight_layout()
 	show_or_save(fig, 'batch_size')
 
+def run_experiment_weight_scale():
+	get_device = make_device_selector()
+	epochs = 250
+	n_replicates = N_REPLICATES
+	p = 113
+	train_frac = 0.7
+	batch_size = 16
+
+	# 3 points per octave from 1/16 (2^-4) to 16 (2^4), inclusive → 8 octaves × 3 + 1 = 25 points
+	scales = np.geomspace(1/16, 16, 3 * 8 + 1)
+
+	cmap = matplotlib.colormaps['plasma']
+	colors = [cmap(i / (len(scales) - 1)) for i in range(len(scales))]
+
+	results = [None for _ in scales]
+
+	for si, scale in enumerate(scales):
+		def train_rep(rep, scale=scale):
+			dev = get_device(rep)
+			print(f"Training weight_scale={scale:.4f} replicate {rep+1}/{n_replicates} on {dev}...")
+			return train_model(
+				p=p, epochs=epochs, device=dev, batch_size=batch_size,
+				use_norm=True, mlp_bias=False, weight_decay=0.02,
+				train_frac=train_frac, weight_scale=scale)
+		with ThreadPoolExecutor(max_workers=n_replicates) as pool:
+			results[si] = list(pool.map(train_rep, range(n_replicates)))
+
+	# Plot 1: Learning curves (val acc + train/val loss)
+	fig1, (ax_acc, ax_loss) = plt.subplots(1, 2, figsize=(14, 5))
+	fig1.suptitle(f"p={p}, LN on, no MLP bias, {train_frac:.0%} train — varying initial weight scale")
+
+	for si, scale in enumerate(scales):
+		label = f"×{scale:.3g}"
+		for rep, (_, hist) in enumerate(results[si]):
+			lbl = label if rep == 0 else '_nolegend_'
+			ax_acc.plot(hist['epoch_x'], hist['val_acc'],
+				label=lbl, color=colors[si], alpha=0.6, marker='o', markevery=[-1], markersize=5)
+			ax_loss.plot(hist['epoch_x'], hist['train_loss'],
+				label=f"{label} train" if rep == 0 else '_nolegend_',
+				color=colors[si], linestyle='--', alpha=0.6, marker='o', markevery=[-1], markersize=5)
+			ax_loss.plot(hist['epoch_x'], hist['val_loss'],
+				label=f"{label} val" if rep == 0 else '_nolegend_',
+				color=colors[si], alpha=0.6, marker='o', markevery=[-1], markersize=5)
+
+	ax_acc.set_title("Validation Accuracy")
+	ax_acc.set_xlabel("Effective Epochs")
+	ax_acc.set_ylabel("Accuracy")
+	ax_acc.legend(fontsize=6, ncol=2)
+	ax_acc.grid(True, alpha=0.3)
+
+	ax_loss.set_title("Loss")
+	ax_loss.set_xlabel("Effective Epochs")
+	ax_loss.set_ylabel("Loss")
+	ax_loss.legend(fontsize=6, ncol=2)
+	ax_loss.grid(True, alpha=0.3)
+
+	plt.tight_layout()
+	show_or_save(fig1, 'weight_scale_curves')
+
+	# Plot 2: Summary — final val acc (mean ± std across replicates) vs scale on a log x-axis
+	fig2, ax = plt.subplots(figsize=(8, 5))
+	fig2.suptitle(f"p={p}, LN on, no MLP bias, {train_frac:.0%} train — final val acc vs weight scale")
+
+	final_means = []
+	final_stds = []
+	for si, scale in enumerate(scales):
+		accs = [hist['val_acc'][-1] for _, hist in results[si]]
+		final_means.append(np.mean(accs))
+		final_stds.append(np.std(accs))
+
+	ax.errorbar(scales, final_means, yerr=final_stds, fmt='o-', color='steelblue', capsize=4, linewidth=1.5)
+	ax.axvline(1.0, color='black', linestyle='--', alpha=0.5, label='default scale (×1)')
+	ax.set_xscale('log', base=2)
+	ax.set_xlabel("Weight Scale Multiplier (log₂ scale)")
+	ax.set_ylabel("Final Validation Accuracy")
+	ax.set_title("Final Validation Accuracy vs Initial Weight Scale")
+	ax.legend()
+	ax.grid(True, alpha=0.3)
+
+	plt.tight_layout()
+	show_or_save(fig2, 'weight_scale_summary')
+
+
 if __name__ == "__main__":
 	# run_experiment()
-	run_experiment_train_frac()
+	# run_experiment_train_frac()
 	# run_experiment_batch_size()
+	run_experiment_weight_scale()
