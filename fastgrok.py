@@ -5,10 +5,14 @@ import numpy as np
 import matplotlib
 from torch.func import vmap, jacrev
 from concurrent.futures import ThreadPoolExecutor
+import threading
 import pdb
+
+_compile_lock = threading.Lock()
 
 BATCH_SIZE = 64
 N_REPLICATES = 4
+JOBS_PER_GPU = 8   # concurrent training runs per GPU for weight-scale experiment
 SHOW_PLOTS = False  # if False, save figures as PDFs instead of displaying
 USE_ROPE = True # if False, use learned position encoding.
 
@@ -134,7 +138,7 @@ def make_device_selector():
 		return lambda rep: device
 
 
-def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=False, mlp_bias=True, weight_decay=2e-2, train_frac=0.6, mlp_act='relu', betas=(0.9, 0.995), schedule_wd=False):
+def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=False, mlp_bias=True, weight_decay=2e-2, train_frac=0.6, mlp_act='relu', betas=(0.9, 0.995), schedule_wd=False, weight_scale=1.0, compile_model=True):
 	dataset, labels = [], []
 	for a in range(p):
 		for b in range(p):
@@ -164,6 +168,11 @@ def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=
 
 	model = GrokkingTransformer(p, d, use_norm=use_norm, mlp_bias=mlp_bias, mlp_act=mlp_act).to(device)
 
+	if weight_scale != 1.0:
+		with torch.no_grad():
+			for param in model.parameters():
+				param.mul_(weight_scale)
+
 	optimizer = optim.AdamW(model.parameters(),
 							lr=1e-3,
 							weight_decay=weight_decay,
@@ -171,13 +180,26 @@ def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=
 							betas=betas,
 							eps=1e-5)              #  prevent division-by-zero explosions)
 	criterion = nn.CrossEntropyLoss()
+
+	if compile_model:
+		model = torch.compile(model)
+		# CompileEventLogger.compilation_metric is called on every compiled
+		# backward (not just first-time compilation) and writes to shared
+		# class-level state — it is not thread-safe. Pre-warm fwd+bwd under a
+		# lock so all AOT-Autograd tracing finishes before parallel training
+		# begins. Only safe to use compile_model=True in single-threaded runs.
+		with _compile_lock:
+			_nb = min(batch_size if batch_size is not None else n_train, n_train)
+			criterion(model(train_data[:_nb]), train_labels[:_nb]).backward()
+			optimizer.zero_grad()
+			model(val_data)
+
 	history = {'train_loss':[], 'val_loss':[], 'val_acc':[], 'epoch_x':[]}
 	current_wd = weight_decay
 	current_lr = 1e-3
 	last_decay_epoch = -1
 
 	for step in range(total_steps):
-		model.train()
 		optimizer.zero_grad()
 
 		if use_minibatch:
@@ -204,19 +226,20 @@ def train_model(p=59, d=64, epochs=250, device='cpu', batch_size=None, use_norm=
 		optimizer.step()
 
 		if step % log_every == 0:
-			model.eval()
-			with torch.no_grad():
-				val_logits = model(val_data)
-				v_loss = criterion(val_logits, val_labels).item()
-				preds = torch.argmax(val_logits, dim=1)
-				v_acc = (preds == val_labels).float().mean().item()
+			# No train/eval toggle and no no_grad: avoids dynamo grad_mode recompilation.
+			# This model has no dropout/batchnorm so toggling is a no-op anyway.
+			# .detach() frees the val graph immediately without building a second compiled variant.
+			val_logits = model(val_data).detach()
+			v_loss = criterion(val_logits, val_labels).item()
+			preds = torch.argmax(val_logits, dim=1)
+			v_acc = (preds == val_labels).float().mean().item()
 
-				history['epoch_x'].append(step / steps_per_epoch)
-				history['train_loss'].append(loss.item())
-				history['val_loss'].append(v_loss)
-				history['val_acc'].append(v_acc)
+			history['epoch_x'].append(step / steps_per_epoch)
+			history['train_loss'].append(loss.item())
+			history['val_loss'].append(v_loss)
+			history['val_acc'].append(v_acc)
 
-				if v_acc >= 1.0:
+			if v_acc >= 1.0:
 					break
 
 	return model, history
@@ -419,7 +442,106 @@ def run_experiment_batch_size():
 	plt.tight_layout()
 	show_or_save(fig, 'batch_size')
 
+def run_experiment_weight_scale():
+	epochs = 250
+	n_replicates = N_REPLICATES
+	p = 113
+	train_frac = 0.7
+	batch_size = 16
+
+	n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+	base_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+	max_workers = n_gpus * JOBS_PER_GPU  # e.g. 2 GPUs × 8 = 16 concurrent jobs
+
+	# 3 points per octave from 1/16 (2^-4) to 16 (2^4), inclusive → 8 octaves × 3 + 1 = 25 points
+	scales = np.geomspace(1/16, 16, 3 * 8 + 1)
+
+	cmap = matplotlib.colormaps['plasma']
+	colors = [cmap(i / (len(scales) - 1)) for i in range(len(scales))]
+
+	# Build a flat list of (scale_idx, scale, rep) jobs; device cycles across GPUs by job slot
+	all_jobs = [(si, scale, rep)
+	            for si, scale in enumerate(scales)
+	            for rep in range(n_replicates)]
+
+	def train_job(args):
+		si, scale, rep = args
+		job_idx = si * n_replicates + rep
+		dev = torch.device(f'cuda:{job_idx % n_gpus}') if n_gpus > 1 else torch.device(base_device)
+		print(f"Training weight_scale={scale:.4f} rep {rep+1}/{n_replicates} on {dev}...")
+		return train_model(
+			p=p, epochs=epochs, device=dev, batch_size=batch_size,
+			use_norm=True, mlp_bias=False, weight_decay=0.02,
+			train_frac=train_frac, weight_scale=scale,
+			compile_model=False)  # torch.compile is not thread-safe (CompileEventLogger race)
+
+	print(f"Running {len(all_jobs)} jobs across {n_gpus} GPU(s), {max_workers} concurrent.")
+	with ThreadPoolExecutor(max_workers=max_workers) as pool:
+		flat_results = list(pool.map(train_job, all_jobs))
+
+	# Reassemble into results[si][rep]
+	results = [[None] * n_replicates for _ in scales]
+	for (si, scale, rep), result in zip(all_jobs, flat_results):
+		results[si][rep] = result
+
+	# Plot 1: Learning curves (val acc + train/val loss)
+	fig1, (ax_acc, ax_loss) = plt.subplots(1, 2, figsize=(14, 5))
+	fig1.suptitle(f"p={p}, LN on, no MLP bias, {train_frac:.0%} train — varying initial weight scale")
+
+	for si, scale in enumerate(scales):
+		label = f"×{scale:.3g}"
+		for rep, (_, hist) in enumerate(results[si]):
+			lbl = label if rep == 0 else '_nolegend_'
+			ax_acc.plot(hist['epoch_x'], hist['val_acc'],
+				label=lbl, color=colors[si], alpha=0.6, marker='o', markevery=[-1], markersize=5)
+			ax_loss.plot(hist['epoch_x'], hist['train_loss'],
+				label=f"{label} train" if rep == 0 else '_nolegend_',
+				color=colors[si], linestyle='--', alpha=0.6, marker='o', markevery=[-1], markersize=5)
+			ax_loss.plot(hist['epoch_x'], hist['val_loss'],
+				label=f"{label} val" if rep == 0 else '_nolegend_',
+				color=colors[si], alpha=0.6, marker='o', markevery=[-1], markersize=5)
+
+	ax_acc.set_title("Validation Accuracy")
+	ax_acc.set_xlabel("Effective Epochs")
+	ax_acc.set_ylabel("Accuracy")
+	ax_acc.legend(fontsize=6, ncol=2)
+	ax_acc.grid(True, alpha=0.3)
+
+	ax_loss.set_title("Loss")
+	ax_loss.set_xlabel("Effective Epochs")
+	ax_loss.set_ylabel("Loss")
+	ax_loss.legend(fontsize=6, ncol=2)
+	ax_loss.grid(True, alpha=0.3)
+
+	plt.tight_layout()
+	show_or_save(fig1, 'weight_scale_curves')
+
+	# Plot 2: Summary — final val acc (mean ± std across replicates) vs scale on a log x-axis
+	fig2, ax = plt.subplots(figsize=(8, 5))
+	fig2.suptitle(f"p={p}, LN on, no MLP bias, {train_frac:.0%} train — final val acc vs weight scale")
+
+	final_means = []
+	final_stds = []
+	for si, scale in enumerate(scales):
+		accs = [hist['val_acc'][-1] for _, hist in results[si]]
+		final_means.append(np.mean(accs))
+		final_stds.append(np.std(accs))
+
+	ax.errorbar(scales, final_means, yerr=final_stds, fmt='o-', color='steelblue', capsize=4, linewidth=1.5)
+	ax.axvline(1.0, color='black', linestyle='--', alpha=0.5, label='default scale (×1)')
+	ax.set_xscale('log', base=2)
+	ax.set_xlabel("Weight Scale Multiplier (log₂ scale)")
+	ax.set_ylabel("Final Validation Accuracy")
+	ax.set_title("Final Validation Accuracy vs Initial Weight Scale")
+	ax.legend()
+	ax.grid(True, alpha=0.3)
+
+	plt.tight_layout()
+	show_or_save(fig2, 'weight_scale_summary')
+
+
 if __name__ == "__main__":
-	run_experiment()
+	# run_experiment()
 	# run_experiment_train_frac()
 	# run_experiment_batch_size()
+	run_experiment_weight_scale()
