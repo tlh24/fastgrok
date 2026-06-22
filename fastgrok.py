@@ -420,6 +420,6 @@ def run_experiment_batch_size():
 	show_or_save(fig, 'batch_size')
 
 if __name__ == "__main__":
-	# run_experiment()
-	run_experiment_train_frac()
+	run_experiment()
+	# run_experiment_train_frac()
 	# run_experiment_batch_size()
